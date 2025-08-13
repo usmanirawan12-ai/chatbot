@@ -53,7 +53,7 @@ export default function Page() {
           </main>
 
           <footer className="text-center text-xs text-slate-400/70 pt-2 pb-6">
-            Tip: ubah respons per label di <code className="text-slate-200">RESPONSE_BY_LABEL</code> (TMProvider).
+            Pengembangan dilakukan oleh Kelompok 3<br />
           </footer>
         </div>
       </div>
