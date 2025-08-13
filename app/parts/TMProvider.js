@@ -23,9 +23,27 @@ const AUDIO_BY_LABEL = {}
 const TMContext = createContext(null)
 export const useTM = () => useContext(TMContext)
 
+/** Util: HEAD check untuk memastikan file tersedia di server */
 async function headOk(url) {
   try { const res = await fetch(url, { method: 'HEAD', cache: 'no-store' }); return res.ok }
-  catch { return false }
+  catch (e) { console.error('[TM] HEAD gagal:', url, e); return false }
+}
+
+/** Util: load script eksternal dan tunggu ready */
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    // Jika sudah ada, resolve cepat
+    if (document.querySelector(`script[data-tm="${src}"]`)) return resolve()
+    const s = document.createElement('script')
+    s.src = src
+    s.async = true
+    s.defer = true
+    s.crossOrigin = 'anonymous'
+    s.dataset.tm = src
+    s.onload = () => resolve()
+    s.onerror = (e) => reject(new Error('Gagal memuat script: ' + src))
+    document.head.appendChild(s)
+  })
 }
 
 export default function TMProvider({ children }) {
@@ -59,6 +77,7 @@ export default function TMProvider({ children }) {
   const lastUploadSigRef = useRef(new Map())
   const lastWebcamRespondAtRef = useRef(0)
 
+  // ====== Load TFJS + cek file model + load TM image (ESM → UMD fallback) ======
   useEffect(() => {
     let mounted = true
     ;(async () => {
@@ -68,17 +87,16 @@ export default function TMProvider({ children }) {
         tmRef.current.tf = tf
         await tf.ready().catch(() => {})
         try { await tf.setBackend('webgl'); await tf.ready() }
-        catch { await tf.setBackend('cpu'); await tf.ready() }
+        catch { console.warn('[TM] WebGL blokir → fallback CPU'); await tf.setBackend('cpu'); await tf.ready() }
 
         // === Cek file model ===
         const modelURL = MODEL_DIR + 'model.json'
         const metadataURL = MODEL_DIR + 'metadata.json'
-
         const [okModel, okMeta] = await Promise.all([headOk(modelURL), headOk(metadataURL)])
         if (!okModel || !okMeta) {
           const missing = []
           if (!okModel) missing.push(modelURL)
-          if (!okMeta) missing.push(metadataURL)
+          if (!okMeta)  missing.push(metadataURL)
           setError('File model hilang: ' + missing.join(', '))
           push('assistant', <>File model tidak ditemukan:
             {missing.map((u,i)=>(<div key={i}><a href={u} target="_blank" rel="noreferrer">{u}</a></div>))}
@@ -86,7 +104,7 @@ export default function TMProvider({ children }) {
           return
         }
 
-        // === Baca model.json untuk cek semua .bin ===
+        // === Baca model.json → cek semua .bin ===
         const mj = await (await fetch(modelURL, { cache: 'no-store' })).json()
         const paths = Array.from(new Set((mj?.weightsManifest || []).flatMap(g => g?.paths || [])))
         if (!paths.length) throw new Error('weightsManifest kosong di model.json')
@@ -98,19 +116,32 @@ export default function TMProvider({ children }) {
         }
         if (missingBins.length) {
           setError('BIN hilang: ' + missingBins.join(', '))
-          push('assistant', <>File <b>.bin</b> tidak ditemukan:
+          push('assistant', <>File <b>.bin</b> tidak ditemukan (periksa penamaan persis & huruf besar/kecil):
             {missingBins.map((u,i)=>(<div key={i}><a href={u} target="_blank" rel="noreferrer">{u}</a></div>))}
           </>)
           return
         }
 
-        // === Import @teachablemachine/image (tahan banting) ===
-        const tmMod = await import('@teachablemachine/image')
-        const tmImageLib = tmMod?.default || tmMod?.tmImage || globalThis?.tmImage
-        if (!tmImageLib || typeof tmImageLib.load !== 'function') {
-          console.error('[TM] Modul @teachablemachine/image tidak menyediakan load(). tmMod =', tmMod)
-          throw new Error('Library TM tidak tersedia (default/tmImage/globalThis kosong).')
+        // === Coba import ESM @teachablemachine/image ===
+        let tmImageLib = null
+        try {
+          const tmMod = await import('@teachablemachine/image')
+          tmImageLib = tmMod?.default || tmMod?.tmImage || globalThis?.tmImage || null
+        } catch (e) {
+          console.warn('[TM] Import ESM gagal, akan fallback ke UMD:', e)
         }
+
+        // === Fallback: load UMD dari CDN jika ESM tidak tersedia ===
+        if (!tmImageLib || typeof tmImageLib.load !== 'function') {
+          await loadScript('https://cdn.jsdelivr.net/npm/@teachablemachine/image@latest/dist/teachablemachine-image.min.js')
+          tmImageLib = globalThis?.tmImage
+        }
+
+        if (!tmImageLib || typeof tmImageLib.load !== 'function') {
+          console.error('[TM] Library TM tetap tidak tersedia (default/tmImage/globalThis kosong).')
+          throw new Error('Library TM tidak tersedia. Coba muat ulang halaman.')
+        }
+
         tmRef.current.tmImage = tmImageLib
 
         // === Load model ===
@@ -122,7 +153,7 @@ export default function TMProvider({ children }) {
           const meta = await (await fetch(metadataURL, { cache: 'no-store' })).json()
           const ls = meta?.labels || meta?.label || []
           if (mounted && Array.isArray(ls) && ls.length) setLabels(ls)
-        } catch {}
+        } catch (e) { console.warn('[TM] metadata.json ada tapi gagal parse:', e) }
 
         if (!mounted) return
         setReady(true)
@@ -135,6 +166,7 @@ export default function TMProvider({ children }) {
       }
     })()
 
+    // Voice list (kadang telat load)
     if (speechSupportedRef.current) {
       const loadVoices = () => { window.speechSynthesis.getVoices(); voicesReadyRef.current = true }
       loadVoices()
@@ -143,6 +175,7 @@ export default function TMProvider({ children }) {
     return () => { mounted = false }
   }, [])
 
+  // ====== Util & balasan ======
   const bestOf = (preds) => {
     if (!preds?.length) return null
     let idx = 0
@@ -167,6 +200,7 @@ export default function TMProvider({ children }) {
 
   const replyUnknown = () => (<>Maaf, <span style={{ fontWeight: 800, color: '#000' }}>saya belum tahu</span>. Coba tambahkan dataset gambar yang lebih banyak.</>)
 
+  // ====== TTS ======
   function pickIndonesianVoice() {
     const list = window.speechSynthesis.getVoices()
     return list.find(v => /(^|\W)id(-|_|$)/i.test(v.lang))
@@ -211,6 +245,7 @@ export default function TMProvider({ children }) {
   }
   function markSpoken({ label, prob }) { lastSpokenLabelRef.current = label; lastSpokenScoreRef.current = prob }
 
+  // ====== Prediksi ======
   const predictFrom = useCallback(async (el, { source = 'stream', sig = '' } = {}) => {
     try {
       const model = tmRef.current.model
@@ -228,22 +263,30 @@ export default function TMProvider({ children }) {
     } catch (e) { console.error('[TM] Gagal prediksi:', e); push('assistant', 'Terjadi kendala saat memproses gambar (lihat console).') }
   }, [threshold])
 
+  // ====== Webcam ======
   const startWebcam = useCallback(async (mountNode) => {
-    const { tmImage } = tmRef.current
     try {
       if (!navigator?.mediaDevices?.getUserMedia) { push('assistant','Browser tidak mendukung kamera atau perlu HTTPS.'); return }
+      // ukuran container → canvas full
       const rect = mountNode.getBoundingClientRect()
       const width = Math.max(320, Math.floor(rect.width || 320))
       const height = Math.max(240, Math.floor(rect.height || 240))
+
+      const tmImage = tmRef.current.tmImage
+      if (!tmImage) { push('assistant', 'Library TM belum siap. Muat ulang halaman.'); return }
+
       const webcam = new tmImage.Webcam(width, height, true)
       await webcam.setup({ facingMode: 'environment' })
       await webcam.play()
       tmRef.current.webcam = webcam
+
       mountNode.innerHTML = ''
       const c = webcam.canvas
       c.style.width = '100%'; c.style.height = '100%'; c.style.objectFit = 'cover'; c.style.display = 'block'
       mountNode.appendChild(c)
+
       push('assistant', 'Webcam aktif. Arahkan objek ke kamera.')
+
       const loop = async (ts) => {
         if (!tmRef.current.webcam) return
         if (ts - lastTickRef.current >= 1000 / FPS_LIMIT) {
@@ -272,6 +315,7 @@ export default function TMProvider({ children }) {
     push('assistant', 'Webcam dimatikan.')
   }, [])
 
+  // ====== Upload ======
   const handleFile = useCallback(async (file) => {
     if (!file) return
     push('user', `Mengirim gambar: ${file.name}`)
