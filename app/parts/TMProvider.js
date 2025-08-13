@@ -17,6 +17,10 @@ const WEBCAM_COOLDOWN_MS = 10000
 const TTL_LABEL_MUTE_MS = 15000
 const SCORE_DELTA_TO_SPEAK = 0.10
 
+// CDN fallback (stable)
+const TFJS_CDN = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js'
+const TMIMG_CDN = 'https://cdn.jsdelivr.net/npm/@teachablemachine/image@latest/dist/teachablemachine-image.min.js'
+
 const RESPONSE_BY_LABEL = {}
 const AUDIO_BY_LABEL = {}
 
@@ -32,7 +36,6 @@ async function headOk(url) {
 /** Util: load script eksternal dan tunggu ready */
 function loadScript(src) {
   return new Promise((resolve, reject) => {
-    // Jika sudah ada, resolve cepat
     if (document.querySelector(`script[data-tm="${src}"]`)) return resolve()
     const s = document.createElement('script')
     s.src = src
@@ -41,9 +44,47 @@ function loadScript(src) {
     s.crossOrigin = 'anonymous'
     s.dataset.tm = src
     s.onload = () => resolve()
-    s.onerror = (e) => reject(new Error('Gagal memuat script: ' + src))
+    s.onerror = () => reject(new Error('Gagal memuat script: ' + src))
     document.head.appendChild(s)
   })
+}
+
+/** Pastikan TFJS ready (ESM → UMD fallback) dan expose ke window.tf */
+async function ensureTFReady() {
+  // 1) Coba ESM
+  try {
+    const tf = await import('@tensorflow/tfjs')
+    // expose agar UMD TM bisa melihat window.tf
+    globalThis.tf = tf
+    await tf.ready().catch(() => {})
+    try { await tf.setBackend('webgl'); await tf.ready() } catch { await tf.setBackend('cpu'); await tf.ready() }
+    return tf
+  } catch (e) {
+    console.warn('[TM] Import TFJS ESM gagal, fallback CDN:', e)
+  }
+  // 2) Fallback UMD
+  if (!globalThis.tf) await loadScript(TFJS_CDN)
+  const tf = globalThis.tf
+  if (!tf) throw new Error('TFJS UMD gagal dimuat')
+  try { await tf.ready().catch(() => {}); await tf.setBackend('webgl'); await tf.ready() } catch { await tf.setBackend('cpu'); await tf.ready() }
+  return tf
+}
+
+/** Pastikan Teachable Machine Image siap (ESM → UMD fallback) */
+async function ensureTMImageReady() {
+  // 1) Coba ESM
+  try {
+    const tmMod = await import('@teachablemachine/image')
+    const tm = tmMod?.default || tmMod?.tmImage || globalThis?.tmImage
+    if (tm && typeof tm.load === 'function') return tm
+  } catch (e) {
+    console.warn('[TM] Import TM Image ESM gagal, fallback CDN:', e)
+  }
+  // 2) Fallback UMD (butuh window.tf sudah ada)
+  if (!globalThis.tmImage) await loadScript(TMIMG_CDN)
+  const tm = globalThis.tmImage
+  if (!tm || typeof tm.load !== 'function') throw new Error('Library TM tidak tersedia (UMD).')
+  return tm
 }
 
 export default function TMProvider({ children }) {
@@ -77,19 +118,16 @@ export default function TMProvider({ children }) {
   const lastUploadSigRef = useRef(new Map())
   const lastWebcamRespondAtRef = useRef(0)
 
-  // ====== Load TFJS + cek file model + load TM image (ESM → UMD fallback) ======
+  // ====== Load TFJS + cek file model + load TM image ======
   useEffect(() => {
     let mounted = true
     ;(async () => {
       try {
-        // === TFJS & backend ===
-        const tf = await import('@tensorflow/tfjs')
+        // Pastikan TFJS siap & global
+        const tf = await ensureTFReady()
         tmRef.current.tf = tf
-        await tf.ready().catch(() => {})
-        try { await tf.setBackend('webgl'); await tf.ready() }
-        catch { console.warn('[TM] WebGL blokir → fallback CPU'); await tf.setBackend('cpu'); await tf.ready() }
 
-        // === Cek file model ===
+        // Cek file model
         const modelURL = MODEL_DIR + 'model.json'
         const metadataURL = MODEL_DIR + 'metadata.json'
         const [okModel, okMeta] = await Promise.all([headOk(modelURL), headOk(metadataURL)])
@@ -104,11 +142,10 @@ export default function TMProvider({ children }) {
           return
         }
 
-        // === Baca model.json → cek semua .bin ===
+        // Cek semua .bin dari model.json
         const mj = await (await fetch(modelURL, { cache: 'no-store' })).json()
         const paths = Array.from(new Set((mj?.weightsManifest || []).flatMap(g => g?.paths || [])))
         if (!paths.length) throw new Error('weightsManifest kosong di model.json')
-
         const missingBins = []
         for (const p of paths) {
           const binURL = MODEL_DIR + p
@@ -116,39 +153,21 @@ export default function TMProvider({ children }) {
         }
         if (missingBins.length) {
           setError('BIN hilang: ' + missingBins.join(', '))
-          push('assistant', <>File <b>.bin</b> tidak ditemukan (periksa penamaan persis & huruf besar/kecil):
+          push('assistant', <>File <b>.bin</b> tidak ditemukan (cek penamaan persis & huruf besar/kecil):
             {missingBins.map((u,i)=>(<div key={i}><a href={u} target="_blank" rel="noreferrer">{u}</a></div>))}
           </>)
           return
         }
 
-        // === Coba import ESM @teachablemachine/image ===
-        let tmImageLib = null
-        try {
-          const tmMod = await import('@teachablemachine/image')
-          tmImageLib = tmMod?.default || tmMod?.tmImage || globalThis?.tmImage || null
-        } catch (e) {
-          console.warn('[TM] Import ESM gagal, akan fallback ke UMD:', e)
-        }
-
-        // === Fallback: load UMD dari CDN jika ESM tidak tersedia ===
-        if (!tmImageLib || typeof tmImageLib.load !== 'function') {
-          await loadScript('https://cdn.jsdelivr.net/npm/@teachablemachine/image@latest/dist/teachablemachine-image.min.js')
-          tmImageLib = globalThis?.tmImage
-        }
-
-        if (!tmImageLib || typeof tmImageLib.load !== 'function') {
-          console.error('[TM] Library TM tetap tidak tersedia (default/tmImage/globalThis kosong).')
-          throw new Error('Library TM tidak tersedia. Coba muat ulang halaman.')
-        }
-
+        // Pastikan TM Image siap (ESM → UMD)
+        const tmImageLib = await ensureTMImageReady()
         tmRef.current.tmImage = tmImageLib
 
-        // === Load model ===
+        // Load model
         const model = await tmImageLib.load(modelURL, metadataURL)
         tmRef.current.model = model
 
-        // === Labels ===
+        // Labels
         try {
           const meta = await (await fetch(metadataURL, { cache: 'no-store' })).json()
           const ls = meta?.labels || meta?.label || []
@@ -267,26 +286,20 @@ export default function TMProvider({ children }) {
   const startWebcam = useCallback(async (mountNode) => {
     try {
       if (!navigator?.mediaDevices?.getUserMedia) { push('assistant','Browser tidak mendukung kamera atau perlu HTTPS.'); return }
-      // ukuran container → canvas full
       const rect = mountNode.getBoundingClientRect()
       const width = Math.max(320, Math.floor(rect.width || 320))
       const height = Math.max(240, Math.floor(rect.height || 240))
-
       const tmImage = tmRef.current.tmImage
       if (!tmImage) { push('assistant', 'Library TM belum siap. Muat ulang halaman.'); return }
-
       const webcam = new tmImage.Webcam(width, height, true)
       await webcam.setup({ facingMode: 'environment' })
       await webcam.play()
       tmRef.current.webcam = webcam
-
       mountNode.innerHTML = ''
       const c = webcam.canvas
       c.style.width = '100%'; c.style.height = '100%'; c.style.objectFit = 'cover'; c.style.display = 'block'
       mountNode.appendChild(c)
-
       push('assistant', 'Webcam aktif. Arahkan objek ke kamera.')
-
       const loop = async (ts) => {
         if (!tmRef.current.webcam) return
         if (ts - lastTickRef.current >= 1000 / FPS_LIMIT) {
