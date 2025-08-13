@@ -7,13 +7,13 @@ const MODEL_DIR = '/my_model/'       // folder di /public
 const FPS_LIMIT = 6                  // fps update webcam (render)
 const DEFAULT_THRESHOLD = 0.70
 
-// TTS
-const LOCALE = 'id-ID'               // fokus suara Indonesia
+// TTS (Bahasa Indonesia)
+const LOCALE = 'id-ID'
 const ENABLE_SOUND_DEFAULT = true
 const SPEAK_COOLDOWN_MS = 2500       // jeda minimal antar suara global
 
 // Anti-spam
-const WEBCAM_COOLDOWN_MS = 10000      // jeda minimal antar RESPON webcam (chat+suara) = 5s
+const WEBCAM_COOLDOWN_MS = 10000     // jeda minimal antar RESPON webcam (chat+suara) = 10s
 const TTL_LABEL_MUTE_MS = 15000      // upload: anti spam utk file yg sama (15s)
 const SCORE_DELTA_TO_SPEAK = 0.10    // webcam: bicara lagi jika skor beda >= 0.10
 
@@ -71,36 +71,49 @@ export default function TMProvider({ children }) {
   // Cooldown respon webcam
   const lastWebcamRespondAtRef = useRef(0)
 
-  // ====== Load model ======
+  // ====== Load model & TensorFlow ======
   useEffect(() => {
     let mounted = true
     ;(async () => {
       try {
-        await import('@tensorflow/tfjs')
+        // muat tfjs & siapkan backend
+        const tf = await import('@tensorflow/tfjs')
+        await tf.ready().catch(() => {})
+        try {
+          await tf.setBackend('webgl')
+          await tf.ready()
+        } catch {
+          console.warn('[TM] WebGL backend gagal/terblokir, fallback ke CPU')
+          await tf.setBackend('cpu')
+          await tf.ready()
+        }
+
         const { default: tmImageLib } = await import('@teachablemachine/image')
         tmRef.current.tmImage = tmImageLib
 
+        // cek akses file statis di prod
+        const metaRes = await fetch(MODEL_DIR + 'metadata.json')
+        if (!metaRes.ok) throw new Error('metadata.json HTTP ' + metaRes.status)
+        const meta = await metaRes.json()
+        const ls = meta?.labels || meta?.label || []
+        if (mounted && Array.isArray(ls) && ls.length) setLabels(ls)
+
+        // load model
         const model = await tmImageLib.load(MODEL_DIR + 'model.json', MODEL_DIR + 'metadata.json')
         tmRef.current.model = model
-
-        try {
-          const res = await fetch(MODEL_DIR + 'metadata.json')
-          const meta = await res.json()
-          const ls = meta?.labels || meta?.label || []
-          if (mounted && Array.isArray(ls) && ls.length) setLabels(ls)
-        } catch {}
 
         if (!mounted) return
         setReady(true)
         push('assistant', 'Model siap. Arahkan objek ke kamera atau unggah file.')
       } catch (e) {
-        console.error(e)
+        console.error('[TM] Gagal memuat model/metadata:', e)
         if (!mounted) return
-        setError('Gagal memuat model. Pastikan /public/my_model/ berisi model.json, metadata.json, dan weights*.bin.')
+        setError('Model tidak ditemukan atau gagal dimuat di /my_model/. Cek file di produksi & lihat console.')
+        push('assistant', 'Ups, ada masalah saat memuat model. Cek konsol browser (Network/Console) untuk detail.')
       }
     })()
 
-    // Siapkan voice list (Chrome kadang telat load)
+    // Siapkan voice list (beberapa browser load-nya lambat)
     if (speechSupportedRef.current) {
       const loadVoices = () => { window.speechSynthesis.getVoices(); voicesReadyRef.current = true }
       loadVoices()
@@ -169,7 +182,7 @@ export default function TMProvider({ children }) {
       window.speechSynthesis.cancel()
       window.speechSynthesis.speak(u)
     } catch (e) {
-      console.warn('TTS gagal:', e)
+      console.warn('[TM] TTS gagal:', e)
     }
   }
 
@@ -217,24 +230,28 @@ export default function TMProvider({ children }) {
 
   // ====== Prediksi ======
   const predictFrom = useCallback(async (el, { source = 'stream', sig = '' } = {}) => {
-    const model = tmRef.current.model
-    if (!model || !el) return
-    const preds = await model.predict(el)
-    const top = bestOf(preds)
-    setPredList(preds)
-    setTop1(top)
-    if (!top) return
+    try {
+      const model = tmRef.current.model
+      if (!model || !el) return
+      const preds = await model.predict(el)
+      const top = bestOf(preds)
+      setPredList(preds)
+      setTop1(top)
+      if (!top) return
 
-    if (top.probability >= threshold) {
-      push('assistant', replyFor(top.className, top.probability))
-      if (shouldSpeak({ label: top.className, prob: top.probability, source, sig })) {
-        playSoundForLabel(top.className, top.probability)
-        markSpoken({ label: top.className, prob: top.probability })
+      if (top.probability >= threshold) {
+        push('assistant', replyFor(top.className, top.probability))
+        if (shouldSpeak({ label: top.className, prob: top.probability, source, sig })) {
+          playSoundForLabel(top.className, top.probability)
+          markSpoken({ label: top.className, prob: top.probability })
+        }
+      } else {
+        push('assistant', replyUnknown())
+        speakUnknown()
       }
-    } else {
-      push('assistant', replyUnknown())
-      // Unknown: cukup hormati cooldown suara global
-      speakUnknown()
+    } catch (e) {
+      console.error('[TM] Gagal prediksi:', e)
+      push('assistant', 'Terjadi kendala saat memproses gambar (lihat console).')
     }
   }, [threshold])
 
@@ -242,13 +259,22 @@ export default function TMProvider({ children }) {
   const startWebcam = useCallback(async (mountNode) => {
     const { tmImage } = tmRef.current
     try {
+      if (!navigator?.mediaDevices?.getUserMedia) {
+        push('assistant', 'Browser tidak mendukung kamera atau perlu HTTPS.')
+        return
+      }
+
       // Ambil ukuran container agar canvas bisa "full"
       const rect = mountNode.getBoundingClientRect()
       const width = Math.max(320, Math.floor(rect.width || 320))
       const height = Math.max(240, Math.floor(rect.height || 240))
 
       const webcam = new tmImage.Webcam(width, height, true)
-      await webcam.setup()
+      await webcam.setup({ facingMode: 'environment' }).catch(err => {
+        // jika user menolak permission, kita tampilkan pesan yang ramah
+        console.error('[TM] getUserMedia error:', err)
+        throw err
+      })
       await webcam.play()
       tmRef.current.webcam = webcam
 
@@ -268,7 +294,7 @@ export default function TMProvider({ children }) {
         if (ts - lastTickRef.current >= 1000 / FPS_LIMIT) {
           tmRef.current.webcam.update()
 
-          // RESPON webcam dibatasi setiap 5 detik
+          // RESPON webcam dibatasi setiap 10 detik
           const now = Date.now()
           if (now - lastWebcamRespondAtRef.current >= WEBCAM_COOLDOWN_MS) {
             await predictFrom(tmRef.current.webcam.canvas, { source: 'stream' })
@@ -281,8 +307,11 @@ export default function TMProvider({ children }) {
       }
       rafRef.current = requestAnimationFrame(loop)
     } catch (e) {
-      console.error(e)
-      push('assistant', 'Gagal mengaktifkan webcam. Pastikan izin kamera diberikan.')
+      console.error('[TM] Start webcam gagal:', e)
+      const msg = e?.name === 'NotAllowedError'
+        ? 'Akses kamera ditolak. Beri izin kamera di browser.'
+        : 'Gagal mengaktifkan webcam. Pastikan situs ini HTTPS dan kamera tersedia.'
+      push('assistant', msg)
     }
   }, [predictFrom])
 
@@ -299,6 +328,8 @@ export default function TMProvider({ children }) {
   const handleFile = useCallback(async (file) => {
     if (!file) return
     push('user', `Mengirim gambar: ${file.name}`)
+
+    // Buat URL & tampilkan preview
     const url = URL.createObjectURL(file)
     if (imgURL) URL.revokeObjectURL(imgURL)
     setImgURL(url)
@@ -306,10 +337,21 @@ export default function TMProvider({ children }) {
     // Signature file (untuk dedupe)
     const sig = `${file.name}:${file.size}:${file.lastModified}`
 
-    setTimeout(async () => {
-      if (imgRef.current) await predictFrom(imgRef.current, { source: 'upload', sig })
+    // Tunggu gambar benar-benar ter-load sebelum prediksi
+    const imgEl = new Image()
+    imgEl.onload = async () => {
+      if (imgRef.current) {
+        imgRef.current.src = url
+        await predictFrom(imgRef.current, { source: 'upload', sig })
+      }
       URL.revokeObjectURL(url)
-    }, 30)
+    }
+    imgEl.onerror = () => {
+      console.error('[TM] Gagal memuat image upload')
+      push('assistant', 'Gambar gagal dimuat.')
+      URL.revokeObjectURL(url)
+    }
+    imgEl.src = url
   }, [imgURL, predictFrom])
 
   const value = {
