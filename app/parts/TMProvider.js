@@ -32,6 +32,17 @@ const AUDIO_BY_LABEL = {
 const TMContext = createContext(null)
 export const useTM = () => useContext(TMContext)
 
+/** Util: HEAD check untuk memastikan file tersedia di server */
+async function headOk(url) {
+  try {
+    const res = await fetch(url, { method: 'HEAD', cache: 'no-store' })
+    return res.ok
+  } catch (e) {
+    console.error('[TM] HEAD gagal untuk', url, e)
+    return false
+  }
+}
+
 export default function TMProvider({ children }) {
   const [ready, setReady] = useState(false)
   const [error, setError] = useState('')
@@ -46,7 +57,7 @@ export default function TMProvider({ children }) {
   const push = (role, textOrNode) => setChat(prev => [...prev, { role, text: textOrNode }])
 
   // TM internals
-  const tmRef = useRef({ tmImage: null, model: null, webcam: null })
+  const tmRef = useRef({ tf: null, tmImage: null, model: null, webcam: null })
   const rafRef = useRef(0)
   const lastTickRef = useRef(0)
 
@@ -71,36 +82,88 @@ export default function TMProvider({ children }) {
   // Cooldown respon webcam
   const lastWebcamRespondAtRef = useRef(0)
 
-  // ====== Load model & TensorFlow ======
+  // ====== Load model & TensorFlow + DEBUG CEKS ======
   useEffect(() => {
     let mounted = true
     ;(async () => {
       try {
-        // muat tfjs & siapkan backend
+        /** 1) Muat TFJS, pilih backend terbaik */
         const tf = await import('@tensorflow/tfjs')
+        tmRef.current.tf = tf
         await tf.ready().catch(() => {})
         try {
-          await tf.setBackend('webgl')
-          await tf.ready()
+          await tf.setBackend('webgl'); await tf.ready()
         } catch {
-          console.warn('[TM] WebGL backend gagal/terblokir, fallback ke CPU')
-          await tf.setBackend('cpu')
-          await tf.ready()
+          console.warn('[TM] WebGL gagal/terblokir → fallback CPU')
+          await tf.setBackend('cpu'); await tf.ready()
         }
 
+        /** 2) Cek ketersediaan model.json & metadata.json */
+        const modelURL = MODEL_DIR + 'model.json'
+        const metadataURL = MODEL_DIR + 'metadata.json'
+
+        const modelOk = await headOk(modelURL)
+        const metaOk  = await headOk(metadataURL)
+
+        if (!modelOk || !metaOk) {
+          const missing = []
+          if (!modelOk)  missing.push(modelURL)
+          if (!metaOk)   missing.push(metadataURL)
+          const msg = `File model hilang di produksi: ${missing.join(', ')}`
+          console.error('[TM]', msg)
+          setError(msg)
+          push('assistant', <>
+            Gagal memuat model karena file tidak ditemukan:<br/>
+            {missing.map((u,i)=>(<div key={i}><a href={u} target="_blank" rel="noreferrer">{u}</a></div>))}
+          </>)
+          return
+        }
+
+        /** 3) Baca model.json → cek SEMUA file .bin yang dirujuk */
+        const modelJson = await (await fetch(modelURL, { cache: 'no-store' })).json()
+        const paths = Array.from(new Set(
+          (modelJson?.weightsManifest || [])
+            .flatMap(g => g?.paths || [])
+        ))
+        if (!paths.length) {
+          const msg = 'weightsManifest kosong di model.json'
+          console.error('[TM]', msg, modelJson)
+          setError(msg)
+          push('assistant', 'Gagal: weightsManifest kosong di model.json.')
+          return
+        }
+
+        const missingBins = []
+        for (const p of paths) {
+          const binURL = MODEL_DIR + p
+          const ok = await headOk(binURL)
+          if (!ok) missingBins.push(binURL)
+        }
+        if (missingBins.length) {
+          const msg = 'File .bin berikut tidak ditemukan: ' + missingBins.join(', ')
+          console.error('[TM]', msg)
+          setError(msg)
+          push('assistant', <>
+            Beberapa file <b>.bin</b> tidak ditemukan (cek penamaan persis & huruf besar/kecil):<br/>
+            {missingBins.map((u,i)=>(<div key={i}><a href={u} target="_blank" rel="noreferrer">{u}</a></div>))}
+          </>)
+          return
+        }
+
+        /** 4) Load library TM & model */
         const { default: tmImageLib } = await import('@teachablemachine/image')
         tmRef.current.tmImage = tmImageLib
-
-        // cek akses file statis di prod
-        const metaRes = await fetch(MODEL_DIR + 'metadata.json')
-        if (!metaRes.ok) throw new Error('metadata.json HTTP ' + metaRes.status)
-        const meta = await metaRes.json()
-        const ls = meta?.labels || meta?.label || []
-        if (mounted && Array.isArray(ls) && ls.length) setLabels(ls)
-
-        // load model
-        const model = await tmImageLib.load(MODEL_DIR + 'model.json', MODEL_DIR + 'metadata.json')
+        const model = await tmImageLib.load(modelURL, metadataURL)
         tmRef.current.model = model
+
+        /** 5) Ambil labels dari metadata.json */
+        try {
+          const meta = await (await fetch(metadataURL, { cache: 'no-store' })).json()
+          const ls = meta?.labels || meta?.label || []
+          if (mounted && Array.isArray(ls) && ls.length) setLabels(ls)
+        } catch (e) {
+          console.warn('[TM] metadata.json ada tapi gagal parse:', e)
+        }
 
         if (!mounted) return
         setReady(true)
@@ -108,7 +171,7 @@ export default function TMProvider({ children }) {
       } catch (e) {
         console.error('[TM] Gagal memuat model/metadata:', e)
         if (!mounted) return
-        setError('Model tidak ditemukan atau gagal dimuat di /my_model/. Cek file di produksi & lihat console.')
+        setError('Model gagal dimuat (lihat Console → Network untuk rinciannya).')
         push('assistant', 'Ups, ada masalah saat memuat model. Cek konsol browser (Network/Console) untuk detail.')
       }
     })()
@@ -188,11 +251,7 @@ export default function TMProvider({ children }) {
 
   function playSoundForLabel(label, prob) {
     const url = AUDIO_BY_LABEL[label]
-    if (url) {
-      const a = new Audio(url)
-      a.play().catch(() => {})
-      return
-    }
+    if (url) { new Audio(url).play().catch(()=>{}); return }
     speak(`Terdeteksi ${label}. Keyakinan ${(prob * 100).toFixed(0)} persen.`)
   }
 
@@ -271,7 +330,6 @@ export default function TMProvider({ children }) {
 
       const webcam = new tmImage.Webcam(width, height, true)
       await webcam.setup({ facingMode: 'environment' }).catch(err => {
-        // jika user menolak permission, kita tampilkan pesan yang ramah
         console.error('[TM] getUserMedia error:', err)
         throw err
       })
@@ -347,7 +405,7 @@ export default function TMProvider({ children }) {
       URL.revokeObjectURL(url)
     }
     imgEl.onerror = () => {
-      console.error('[TM] Gagal memuat image upload')
+      console.error('[TM] Gambar upload gagal dimuat')
       push('assistant', 'Gambar gagal dimuat.')
       URL.revokeObjectURL(url)
     }
